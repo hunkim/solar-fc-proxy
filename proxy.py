@@ -36,6 +36,13 @@ TOOL_RELATED_PARAMS = [
     'response_format'
 ]
 
+# Helper to normalize model name
+def normalize_model_name(model: str) -> str:
+    """If model does not start with 'solar' (case-insensitive), replace it with 'Solar-Strawberry'"""
+    if not isinstance(model, str) or not model.lower().startswith('solar'):
+        return 'Solar-Strawberry'
+    return model
+
 app = FastAPI(title="Solar Function Call Proxy")
 
 # Configure CORS middleware
@@ -184,7 +191,13 @@ def sanitize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Sanitize and validate the payload without modifying model selection"""
     # Create a copy to avoid modifying the original
     sanitized = payload.copy()
-    
+
+    # Normalize model name
+    original_model = sanitized.get('model')
+    sanitized['model'] = normalize_model_name(original_model)
+    if original_model != sanitized['model']:
+        logger.info(f"Normalized model name from {original_model} to {sanitized['model']}")
+
     # Ensure messages is a list
     if "messages" not in sanitized or not isinstance(sanitized["messages"], list):
         sanitized["messages"] = []
@@ -344,10 +357,11 @@ async def chat_completions(
     try:
         # Parse request body
         body = await request.json()
-        
+
+        model = body.get('model')
         # Log request details
         msg_count = len(body.get('messages', []))
-        logger.info(f"Request received with {msg_count} messages, model: {body.get('model', 'unspecified')}")
+        logger.info(f"Request received with {msg_count} messages, model: {model}")
         logger.info(f"Request body: {json.dumps(body, indent=2)}")
         
         # Ensure BASE_URL is set
@@ -454,7 +468,7 @@ async def chat_completions(
         openai_response = format_openai_response(
             llm_response, 
             function_data,
-            body.get('model', 'solar-pro')  # Use the model from the request or a generic fallback
+            normalize_model_name(body.get('model', 'solar-pro'))  # Use the normalized model name
         )
         
         # Convert function_call to tool_call if original request used tools format
