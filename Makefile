@@ -13,7 +13,7 @@ $(VENV)/bin/activate: requirements.txt
 	$(PIP) install -r requirements.txt
 
 proxy: $(VENV)/bin/activate
-	$(UVICORN) proxy:app --reload --port 9097
+	$(UVICORN) proxy:app --reload --port 9098
 
 clean:
 	rm -rf __pycache__
