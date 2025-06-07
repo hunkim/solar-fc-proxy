@@ -314,19 +314,12 @@ async def chat_completions(request: Request):
             detail="Unauthorized: API key required. Please provide a valid API key in the Authorization header."
         )
     
-    # Extract client API key (we accept any valid Bearer token for now)
+    # Extract client API key
     client_api_key = auth_header[7:]  # Remove "Bearer " prefix
     if not client_api_key.strip():
         raise HTTPException(
             status_code=401,
             detail="Unauthorized: Invalid API key format."
-        )
-    
-    # Check if our server has the required Upstage API key
-    if not UPSTAGE_API_KEY:
-        raise HTTPException(
-            status_code=500, 
-            detail="API key not configured. Please set UPSTAGE_API_KEY environment variable."
         )
     
     # Track timing and metadata for Firebase logging
@@ -360,9 +353,9 @@ async def chat_completions(request: Request):
             enhanced_messages = generate_function_calling_prompt(original_messages, tools, tool_choice)
             body["messages"] = enhanced_messages
         
-        # Prepare headers for upstream request
+        # Prepare headers for upstream request (use client API key)
         headers = {
-            "Authorization": f"Bearer {UPSTAGE_API_KEY}",
+            "Authorization": f"Bearer {client_api_key}",
             "Content-Type": "application/json"
         }
     
@@ -408,10 +401,8 @@ async def chat_completions(request: Request):
                 # Async log to Firebase (fire and forget)
                 asyncio.create_task(firebase_logger.log_error(original_body, error_details, metadata))
                 
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Upstream API error: {error_text}"
-                )
+                # Relay upstream error directly to client
+                return Response(content=error_text, status_code=response.status_code, media_type="application/json")
             
             # Handle streaming response
             if is_streaming:
@@ -473,7 +464,7 @@ async def chat_completions(request: Request):
                 asyncio.create_task(firebase_logger.log_request_response(original_body, response_data, metadata))
                 
                 return response_data
-                
+    
     except json.JSONDecodeError as e:
         # Log JSON decode error
         response_time = (time.time() - start_time) * 1000
@@ -497,7 +488,7 @@ async def chat_completions(request: Request):
         
         raise HTTPException(
             status_code=400,
-            detail="Invalid JSON in request body"
+            detail=f"Invalid JSON in request body: {str(e)}"
         )
     except httpx.TimeoutException:
         logger.error("Request to upstream API timed out")

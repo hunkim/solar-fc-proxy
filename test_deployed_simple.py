@@ -5,6 +5,35 @@ Simple test for deployed Solar proxy once API key is configured
 
 import requests
 import json
+import os
+from dotenv import load_dotenv
+
+load_dotenv('.env.local')
+UPSTAGE_API_KEY = os.getenv('UPSTAGE_API_KEY', 'test-key')
+
+LOCAL_URL = "http://localhost:8000"
+DEPLOYED_URL = "https://solar-fc-proxy.vercel.app"
+
+headers = {
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {UPSTAGE_API_KEY}"
+}
+
+def run_test(url):
+    payload = {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hello, test!"}]
+    }
+    print(f"\nTesting {url}/v1/chat/completions ...")
+    try:
+        response = requests.post(f"{url}/v1/chat/completions", headers=headers, json=payload, timeout=15)
+        print(f"Status: {response.status_code}")
+        try:
+            print(f"Response: {response.json()}")
+        except Exception:
+            print(f"Raw response: {response.text}")
+    except Exception as e:
+        print(f"❌ Error connecting to {url}: {e}")
 
 def test_deployed_proxy():
     url = "https://solar-fc-proxy.vercel.app"
@@ -78,4 +107,5 @@ def test_deployed_proxy():
         print("   5. Redeploy the project")
 
 if __name__ == "__main__":
-    test_deployed_proxy() 
+    run_test(LOCAL_URL)
+    run_test(DEPLOYED_URL) 
