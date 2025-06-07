@@ -209,16 +209,37 @@ async def stream_response_with_logging(
 ) -> AsyncGenerator[str, None]:
     """Stream the response from the upstream API with logging"""
     accumulated_response = ""
+    accumulated_content = ""
+    response_id = None
+    
     try:
         async for chunk in response.aiter_text():
             if chunk:
                 accumulated_response += chunk
+                
+                # Try to extract content from streaming chunks
+                lines = chunk.split('\n')
+                for line in lines:
+                    if line.startswith('data: '):
+                        data_str = line[6:]
+                        if data_str.strip() != '[DONE]':
+                            try:
+                                data = json.loads(data_str)
+                                if not response_id:
+                                    response_id = data.get('id', f"chatcmpl-{uuid.uuid4().hex[:8]}")
+                                
+                                delta_content = data.get('choices', [{}])[0].get('delta', {}).get('content')
+                                if delta_content:
+                                    accumulated_content += delta_content
+                            except json.JSONDecodeError:
+                                pass
+                
                 yield chunk
     except Exception as e:
         logger.error(f"Error streaming response: {e}")
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
     finally:
-        # Log the complete streaming response
+        # Log the complete streaming response in proper OpenAI format
         response_time = (time.time() - start_time) * 1000
         metadata = {
             'response_time_ms': response_time,
@@ -232,11 +253,30 @@ async def stream_response_with_logging(
             'endpoint': '/v1/chat/completions'
         }
         
-        # Create a simplified response structure for logging
+        # Create a proper OpenAI chat completion response format for logging
         response_data = {
-            'streaming_response': True,
-            'content_length': len(accumulated_response),
-            'partial_content': accumulated_response[:500] + "..." if len(accumulated_response) > 500 else accumulated_response
+            "id": response_id or f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": DEFAULT_MODEL_NAME,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": accumulated_content
+                },
+                "logprobs": None,
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": -1,  # Not available in streaming
+                "completion_tokens": -1,  # Not available in streaming 
+                "total_tokens": -1
+            },
+            "_streaming_metadata": {
+                "content_length": len(accumulated_response),
+                "chunks_received": len([line for line in accumulated_response.split('\n') if line.startswith('data:')])
+            }
         }
         
         # Async log to Firebase (fire and forget)
@@ -256,6 +296,7 @@ async def stream_function_call_response_with_logging(
     accumulated_response = ""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     function_calls_detected = 0
+    extracted_function_calls = []
     
     try:
         async for chunk in response.aiter_text():
@@ -272,6 +313,7 @@ async def stream_function_call_response_with_logging(
                             
                             if function_calls:
                                 function_calls_detected = len(function_calls)
+                                extracted_function_calls = function_calls
                                 # Send function call events
                                 for i, func_call in enumerate(function_calls):
                                     # Send function call start event
@@ -323,7 +365,7 @@ async def stream_function_call_response_with_logging(
         logger.error(f"Error streaming function call response: {e}")
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
     finally:
-        # Log the complete streaming response
+        # Log the complete streaming response in proper OpenAI format
         response_time = (time.time() - start_time) * 1000
         metadata = {
             'response_time_ms': response_time,
@@ -337,13 +379,71 @@ async def stream_function_call_response_with_logging(
             'endpoint': '/v1/chat/completions'
         }
         
-        # Create a simplified response structure for logging
-        response_data = {
-            'streaming_response': True,
-            'function_calls_detected': function_calls_detected,
-            'content_length': len(accumulated_response),
-            'partial_content': accumulated_response[:500] + "..." if len(accumulated_response) > 500 else accumulated_response
-        }
+        # Create a proper OpenAI chat completion response format for logging
+        if function_calls_detected > 0:
+            # Format as function calling response
+            tool_calls = []
+            for i, func_call in enumerate(extracted_function_calls):
+                tool_calls.append({
+                    "id": func_call.get("call_id", f"call_{uuid.uuid4().hex[:8]}"),
+                    "type": "function",
+                    "function": {
+                        "name": func_call["name"],
+                        "arguments": func_call["arguments"]
+                    }
+                })
+            
+            response_data = {
+                "id": response_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": DEFAULT_MODEL_NAME,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": tool_calls
+                    },
+                    "logprobs": None,
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": -1,  # Not available in streaming
+                    "completion_tokens": -1,  # Not available in streaming 
+                    "total_tokens": -1
+                },
+                "_streaming_metadata": {
+                    "content_length": len(accumulated_response),
+                    "chunks_received": len([line for line in accumulated_response.split('\n') if line.startswith('data:')])
+                }
+            }
+        else:
+            # Format as regular response
+            response_data = {
+                "id": response_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": DEFAULT_MODEL_NAME,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": accumulated_content
+                    },
+                    "logprobs": None,
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": -1,  # Not available in streaming
+                    "completion_tokens": -1,  # Not available in streaming 
+                    "total_tokens": -1
+                },
+                "_streaming_metadata": {
+                    "content_length": len(accumulated_response),
+                    "chunks_received": len([line for line in accumulated_response.split('\n') if line.startswith('data:')])
+                }
+            }
         
         # Async log to Firebase (fire and forget)
         asyncio.create_task(firebase_logger.log_request_response(original_body, response_data, metadata))
