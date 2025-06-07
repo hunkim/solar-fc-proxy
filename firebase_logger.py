@@ -117,7 +117,8 @@ class FirebaseLogger:
                 'reasoning_effort': sanitized_request.get('reasoning_effort'),
                 'message_count': len(sanitized_request.get('messages', [])),
                 'has_tools': bool(sanitized_request.get('tools')),
-                'has_function_calls': bool(sanitized_response.get('choices', [{}])[0].get('message', {}).get('tool_calls'))
+                'has_function_calls': bool(sanitized_response.get('choices', [{}])[0].get('message', {}).get('tool_calls')),
+                '_upstream_content': sanitized_request.get('_upstream_content')  # Include upstream content for transparency
             },
             'response': {
                 'model': sanitized_response.get('model'),
@@ -150,7 +151,7 @@ class FirebaseLogger:
                 return
 
             # Write to Firestore collection
-            collection_name = f"proxy_logs_{datetime.now().strftime('%Y_%m')}"  # Monthly collections
+            collection_name = f"proxy_logs_{datetime.now().strftime('%Y_%m_%d')}"  # Daily collections
             doc_ref = self.db.collection(collection_name).document(log_entry['request_id'])
             doc_ref.set(log_entry)
             

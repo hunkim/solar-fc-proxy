@@ -214,7 +214,7 @@ def test_proxy_logs_collection():
         db = firestore.client()
         
         # Use the same format as the proxy
-        collection_name = f"proxy_logs_{datetime.now().strftime('%Y_%m')}"
+        collection_name = f"proxy_logs_{datetime.now().strftime('%Y_%m_%d')}"
         
         # Create sample proxy log data
         proxy_log_data = {

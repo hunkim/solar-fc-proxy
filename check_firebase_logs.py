@@ -43,9 +43,9 @@ def check_proxy_logs():
         # Get Firestore client
         db = firestore.client()
         
-        # Check current month's collection
-        current_month = datetime.now().strftime('%Y_%m')
-        collection_name = f"proxy_logs_{current_month}"
+        # Check current day's collection
+        current_day = datetime.now().strftime('%Y_%m_%d')
+        collection_name = f"proxy_logs_{current_day}"
         
         print(f"  📂 Checking collection: {collection_name}")
         

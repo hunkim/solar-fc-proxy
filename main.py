@@ -203,6 +203,7 @@ def format_function_call_response(function_calls: List[Dict], original_response:
 async def stream_response_with_logging(
     response: httpx.Response, 
     original_body: Dict, 
+    upstream_content: Dict,
     start_time: float,
     original_model: str,
     request: Request
@@ -279,13 +280,19 @@ async def stream_response_with_logging(
             }
         }
         
+        # Create enhanced original_body with upstream_content if modified
+        enhanced_original_body = original_body.copy()
+        if upstream_content:
+            enhanced_original_body['_upstream_content'] = upstream_content
+        
         # Async log to Firebase (fire and forget)
-        asyncio.create_task(firebase_logger.log_request_response(original_body, response_data, metadata))
+        asyncio.create_task(firebase_logger.log_request_response(enhanced_original_body, response_data, metadata))
 
 async def stream_function_call_response_with_logging(
     response: httpx.Response, 
     tools: List[Dict],
     original_body: Dict, 
+    upstream_content: Dict,
     start_time: float,
     original_model: str,
     request: Request
@@ -445,8 +452,13 @@ async def stream_function_call_response_with_logging(
                 }
             }
         
+        # Create enhanced original_body with upstream_content if modified
+        enhanced_original_body = original_body.copy()
+        if upstream_content:
+            enhanced_original_body['_upstream_content'] = upstream_content
+        
         # Async log to Firebase (fire and forget)
-        asyncio.create_task(firebase_logger.log_request_response(original_body, response_data, metadata))
+        asyncio.create_task(firebase_logger.log_request_response(enhanced_original_body, response_data, metadata))
 
 async def stream_response(response: httpx.Response) -> AsyncGenerator[str, None]:
     """Stream the response from the upstream API"""
@@ -583,6 +595,7 @@ async def chat_completions(request: Request):
     # Track timing and metadata for Firebase logging
     start_time = time.time()
     original_body = None
+    upstream_content = None  # Store modified content sent to upstream
     response_data = None
     function_calls_detected = 0
     
@@ -598,6 +611,9 @@ async def chat_completions(request: Request):
         # Override the model with our default
         body["model"] = DEFAULT_MODEL_NAME
         
+        # Always set reasoning_effort to "high" for upstream requests
+        body["reasoning_effort"] = "high"
+        
         # Check if this is a function calling request
         tools = body.pop("tools", None)
         tool_choice = body.pop("tool_choice", "auto")
@@ -610,6 +626,9 @@ async def chat_completions(request: Request):
             original_messages = body.get("messages", [])
             enhanced_messages = generate_function_calling_prompt(original_messages, tools, tool_choice)
             body["messages"] = enhanced_messages
+            
+            # Store the modified upstream content for logging
+            upstream_content = body.copy()
         
         # Prepare headers for upstream request (use client API key)
         headers = {
@@ -656,8 +675,13 @@ async def chat_completions(request: Request):
                     'type': 'upstream_api_error'
                 }
                 
+                # Create enhanced original_body with upstream_content if modified
+                enhanced_original_body = original_body.copy()
+                if upstream_content:
+                    enhanced_original_body['_upstream_content'] = upstream_content
+                
                 # Async log to Firebase (fire and forget)
-                asyncio.create_task(firebase_logger.log_error(original_body, error_details, metadata))
+                asyncio.create_task(firebase_logger.log_error(enhanced_original_body, error_details, metadata))
                 
                 # Relay upstream error directly to client
                 return Response(content=error_text, status_code=response.status_code, media_type="application/json")
@@ -667,7 +691,7 @@ async def chat_completions(request: Request):
                 if tools:
                     # Special handling for function call streaming
                     return StreamingResponse(
-                        stream_function_call_response_with_logging(response, tools, original_body, start_time, original_model, request),
+                        stream_function_call_response_with_logging(response, tools, original_body, upstream_content, start_time, original_model, request),
                         media_type="text/plain",
                         headers={
                             "Cache-Control": "no-cache",
@@ -678,7 +702,7 @@ async def chat_completions(request: Request):
                 else:
                     # Regular streaming
                     return StreamingResponse(
-                        stream_response_with_logging(response, original_body, start_time, original_model, request),
+                        stream_response_with_logging(response, original_body, upstream_content, start_time, original_model, request),
                         media_type="text/plain",
                         headers={
                             "Cache-Control": "no-cache",
@@ -718,8 +742,13 @@ async def chat_completions(request: Request):
                     'endpoint': '/v1/chat/completions'
                 }
                 
+                # Create enhanced original_body with upstream_content if modified
+                enhanced_original_body = original_body.copy()
+                if upstream_content:
+                    enhanced_original_body['_upstream_content'] = upstream_content
+                
                 # Async log to Firebase (fire and forget)
-                asyncio.create_task(firebase_logger.log_request_response(original_body, response_data, metadata))
+                asyncio.create_task(firebase_logger.log_request_response(enhanced_original_body, response_data, metadata))
                 
                 return response_data
     
