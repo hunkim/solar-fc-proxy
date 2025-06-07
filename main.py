@@ -200,6 +200,164 @@ def format_function_call_response(function_calls: List[Dict], original_response:
         "system_fingerprint": original_response.get("system_fingerprint")
     }
 
+async def stream_response_with_logging(
+    response: httpx.Response, 
+    original_body: Dict, 
+    start_time: float,
+    original_model: str,
+    request: Request
+) -> AsyncGenerator[str, None]:
+    """Stream the response from the upstream API with logging"""
+    accumulated_response = ""
+    try:
+        async for chunk in response.aiter_text():
+            if chunk:
+                accumulated_response += chunk
+                yield chunk
+    except Exception as e:
+        logger.error(f"Error streaming response: {e}")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+    finally:
+        # Log the complete streaming response
+        response_time = (time.time() - start_time) * 1000
+        metadata = {
+            'response_time_ms': response_time,
+            'status_code': 200,
+            'original_model': original_model,
+            'mapped_model': DEFAULT_MODEL_NAME,
+            'client_ip': request.client.host if request.client else 'unknown',
+            'user_agent': request.headers.get('user-agent', 'unknown'),
+            'is_streaming': True,
+            'function_calls_detected': 0,
+            'endpoint': '/v1/chat/completions'
+        }
+        
+        # Create a simplified response structure for logging
+        response_data = {
+            'streaming_response': True,
+            'content_length': len(accumulated_response),
+            'partial_content': accumulated_response[:500] + "..." if len(accumulated_response) > 500 else accumulated_response
+        }
+        
+        # Async log to Firebase (fire and forget)
+        asyncio.create_task(firebase_logger.log_request_response(original_body, response_data, metadata))
+
+async def stream_function_call_response_with_logging(
+    response: httpx.Response, 
+    tools: List[Dict],
+    original_body: Dict, 
+    start_time: float,
+    original_model: str,
+    request: Request
+) -> AsyncGenerator[str, None]:
+    """Stream function call responses in OpenAI format with logging"""
+    
+    accumulated_content = ""
+    accumulated_response = ""
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    function_calls_detected = 0
+    
+    try:
+        async for chunk in response.aiter_text():
+            if chunk:
+                accumulated_response += chunk
+                # Try to parse streaming data
+                lines = chunk.split('\n')
+                for line in lines:
+                    if line.startswith('data: '):
+                        data_str = line[6:]
+                        if data_str.strip() == '[DONE]':
+                            # Process accumulated content for function calls
+                            function_calls, remaining_text = parse_function_calls(accumulated_content)
+                            
+                            if function_calls:
+                                function_calls_detected = len(function_calls)
+                                # Send function call events
+                                for i, func_call in enumerate(function_calls):
+                                    # Send function call start event
+                                    func_event = {
+                                        "id": response_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": 1234567890,
+                                        "model": DEFAULT_MODEL_NAME,
+                                        "choices": [{
+                                            "index": i,
+                                            "delta": {
+                                                "tool_calls": [{
+                                                    "index": i,
+                                                    "id": func_call.get("call_id", f"call_{uuid.uuid4().hex[:8]}"),
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": func_call["name"],
+                                                        "arguments": func_call["arguments"]
+                                                    }
+                                                }]
+                                            },
+                                            "logprobs": None,
+                                            "finish_reason": "tool_calls"
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(func_event)}\n\n"
+                            
+                            yield "data: [DONE]\n\n"
+                            return
+                        
+                        try:
+                            data = json.loads(data_str)
+                            delta_content = data.get('choices', [{}])[0].get('delta', {}).get('content')
+                            if delta_content:
+                                accumulated_content += delta_content
+                                
+                                # Check if we're building function calls
+                                if '[{' in accumulated_content or '{"type"' in accumulated_content:
+                                    # Don't stream content while building function calls
+                                    continue
+                                else:
+                                    # Stream normal content
+                                    yield chunk
+                        except json.JSONDecodeError:
+                            yield chunk
+                    else:
+                        yield chunk
+    except Exception as e:
+        logger.error(f"Error streaming function call response: {e}")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+    finally:
+        # Log the complete streaming response
+        response_time = (time.time() - start_time) * 1000
+        metadata = {
+            'response_time_ms': response_time,
+            'status_code': 200,
+            'original_model': original_model,
+            'mapped_model': DEFAULT_MODEL_NAME,
+            'client_ip': request.client.host if request.client else 'unknown',
+            'user_agent': request.headers.get('user-agent', 'unknown'),
+            'is_streaming': True,
+            'function_calls_detected': function_calls_detected,
+            'endpoint': '/v1/chat/completions'
+        }
+        
+        # Create a simplified response structure for logging
+        response_data = {
+            'streaming_response': True,
+            'function_calls_detected': function_calls_detected,
+            'content_length': len(accumulated_response),
+            'partial_content': accumulated_response[:500] + "..." if len(accumulated_response) > 500 else accumulated_response
+        }
+        
+        # Async log to Firebase (fire and forget)
+        asyncio.create_task(firebase_logger.log_request_response(original_body, response_data, metadata))
+
+async def stream_response(response: httpx.Response) -> AsyncGenerator[str, None]:
+    """Stream the response from the upstream API"""
+    try:
+        async for chunk in response.aiter_text():
+            if chunk:
+                yield chunk
+    except Exception as e:
+        logger.error(f"Error streaming response: {e}")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
 async def stream_function_call_response(response: httpx.Response, tools: List[Dict]) -> AsyncGenerator[str, None]:
     """Stream function call responses in OpenAI format"""
     
@@ -409,7 +567,7 @@ async def chat_completions(request: Request):
                 if tools:
                     # Special handling for function call streaming
                     return StreamingResponse(
-                        stream_function_call_response(response, tools),
+                        stream_function_call_response_with_logging(response, tools, original_body, start_time, original_model, request),
                         media_type="text/plain",
                         headers={
                             "Cache-Control": "no-cache",
@@ -420,7 +578,7 @@ async def chat_completions(request: Request):
                 else:
                     # Regular streaming
                     return StreamingResponse(
-                        stream_response(response),
+                        stream_response_with_logging(response, original_body, start_time, original_model, request),
                         media_type="text/plain",
                         headers={
                             "Cache-Control": "no-cache",
@@ -571,16 +729,6 @@ async def chat_completions(request: Request):
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         )
-
-async def stream_response(response: httpx.Response) -> AsyncGenerator[str, None]:
-    """Stream the response from the upstream API"""
-    try:
-        async for chunk in response.aiter_text():
-            if chunk:
-                yield chunk
-    except Exception as e:
-        logger.error(f"Error streaming response: {e}")
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
 # Optional: Add models endpoint for compatibility
 @app.get("/v1/models")
