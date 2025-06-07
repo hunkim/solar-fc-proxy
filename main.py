@@ -297,13 +297,32 @@ async def health_check():
         "api_key_configured": api_key_configured,
         "service": "Solar Proxy API",
         "default_model": DEFAULT_MODEL_NAME,
-        "features": ["function_calling", "streaming", "model_mapping"]
+        "features": ["function_calling", "streaming", "model_mapping", "api_key_authentication"],
+        "auth_required": True,
+        "auth_info": "Clients must provide a Bearer token in the Authorization header"
     }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """Proxy chat completions to Solar API with model mapping and function calling support"""
     
+    # Check client API key first
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: API key required. Please provide a valid API key in the Authorization header."
+        )
+    
+    # Extract client API key (we accept any valid Bearer token for now)
+    client_api_key = auth_header[7:]  # Remove "Bearer " prefix
+    if not client_api_key.strip():
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Invalid API key format."
+        )
+    
+    # Check if our server has the required Upstage API key
     if not UPSTAGE_API_KEY:
         raise HTTPException(
             status_code=500, 
@@ -346,7 +365,7 @@ async def chat_completions(request: Request):
             "Authorization": f"Bearer {UPSTAGE_API_KEY}",
             "Content-Type": "application/json"
         }
-        
+    
         # Forward user-agent if present
         if "user-agent" in request.headers:
             headers["User-Agent"] = request.headers["user-agent"]
@@ -575,20 +594,21 @@ async def stream_response(response: httpx.Response) -> AsyncGenerator[str, None]
 # Optional: Add models endpoint for compatibility
 @app.get("/v1/models")
 async def list_models():
-    """List available models (returns our default model)"""
+    """List available models (returns only solar-pro2-preview)"""
+    models = [
+        {
+            "id": "solar-pro2-preview",
+            "object": "model",
+            "created": 1677610602,
+            "owned_by": "solar-proxy",
+            "permission": [],
+            "root": "solar-pro2-preview",
+            "parent": None
+        }
+    ]
     return {
         "object": "list",
-        "data": [
-            {
-                "id": DEFAULT_MODEL_NAME,
-                "object": "model",
-                "created": 1677610602,
-                "owned_by": "solar-proxy",
-                "permission": [],
-                "root": DEFAULT_MODEL_NAME,
-                "parent": None
-            }
-        ]
+        "data": models
     }
 
 # Catch-all for other v1 endpoints to provide helpful error messages
