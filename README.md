@@ -7,6 +7,8 @@ A reliable FastAPI proxy that forwards OpenAI-compatible API requests to Solar L
 - 🔄 **Model Mapping**: Automatically maps any requested model to Solar (configurable)
 - 🚀 **OpenAI Compatibility**: Works with any OpenAI-compatible client
 - 📡 **Streaming Support**: Supports both streaming and non-streaming responses
+- 🔧 **Function Calling**: Full function calling support via prompt engineering
+- 📋 **Structured Output**: OpenAI-compatible structured output with JSON schema validation
 - 🔒 **Secure**: API key management with environment variables
 - 📊 **Monitoring**: Built-in health checks and logging
 - 🌐 **Vercel Ready**: Configured for easy deployment on Vercel
@@ -110,6 +112,43 @@ stream = client.chat.completions.create(
 for chunk in stream:
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="")
+```
+
+### Structured Output Example
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="dummy-key",
+    base_url="http://localhost:8000/v1"
+)
+
+response = client.chat.completions.create(
+    model="gpt-4",
+    messages=[{"role": "user", "content": "Generate a person's profile"}],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "person_profile",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"},
+                    "occupation": {"type": "string"}
+                },
+                "required": ["name", "age"],
+                "additionalProperties": False
+            }
+        }
+    }
+)
+
+# Response will be valid JSON matching the schema
+import json
+profile = json.loads(response.choices[0].message.content)
+print(f"Name: {profile['name']}, Age: {profile['age']}")
 ```
 
 ## API Endpoints

@@ -35,6 +35,183 @@ DEFAULT_MODEL_NAME = os.getenv("DEFAULT_MODEL_NAME", "solar-pro2-preview")
 # Timeout configuration
 REQUEST_TIMEOUT = 120.0
 
+# Structured Output Support Functions
+def validate_json_schema(schema: Optional[Dict]) -> bool:
+    """Validate incoming JSON schema structure"""
+    if schema is None:
+        raise ValueError("Schema cannot be null")
+    if not schema:
+        raise ValueError("Schema cannot be empty")
+    
+    # Check required schema fields
+    required_fields = ["type", "properties"]
+    for field in required_fields:
+        if field not in schema:
+            raise ValueError(f"Schema must have '{field}' field")
+    
+    # Validate schema structure
+    if schema["type"] != "object":
+        raise ValueError("Only object type schemas are supported")
+    
+    if not isinstance(schema["properties"], dict):
+        raise ValueError("Properties must be a dictionary")
+    
+    return True
+
+def validate_field_type(value: Any, field_schema: Dict) -> bool:
+    """Validate individual field against its schema"""
+    if "anyOf" in field_schema:
+        # Handle union types (like is_valid: boolean | string)
+        for option in field_schema["anyOf"]:
+            if validate_simple_type(value, option):
+                return True
+        return False
+    else:
+        return validate_simple_type(value, field_schema)
+
+def validate_simple_type(value: Any, type_schema: Dict) -> bool:
+    """Validate value against simple type schema"""
+    expected_type = type_schema.get("type")
+    
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    elif expected_type == "string":
+        return isinstance(value, str)
+    elif expected_type == "number":
+        return isinstance(value, (int, float))
+    elif expected_type == "integer":
+        return isinstance(value, int)
+    elif expected_type == "array":
+        return isinstance(value, list)
+    elif expected_type == "object":
+        return isinstance(value, dict)
+    
+    return False
+
+def validate_response_against_schema(response_json: Dict, schema: Dict) -> bool:
+    """Validate generated JSON against the schema"""
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    
+    # Check required fields
+    for field in required:
+        if field not in response_json:
+            raise ValueError(f"Required field '{field}' missing from response")
+    
+    # Validate field types
+    for field, value in response_json.items():
+        if field in properties:
+            field_schema = properties[field]
+            if not validate_field_type(value, field_schema):
+                raise ValueError(f"Field '{field}' has invalid type. Expected: {field_schema}, Got: {type(value).__name__}")
+    
+    # Check additionalProperties
+    if schema.get("additionalProperties") is False:
+        for field in response_json:
+            if field not in properties:
+                raise ValueError(f"Additional property '{field}' not allowed")
+    
+    return True
+
+def extract_json_from_text(text: str) -> Dict:
+    """Extract JSON from text response if model wraps it"""
+    # Handle reasoning mode: extract content after </think> tag if present
+    working_content = text
+    if '<think>' in text and '</think>' in text:
+        post_think_content = text.split('</think>', 1)[-1].strip()
+        if post_think_content:
+            working_content = post_think_content
+    
+    # Try to parse the entire working content as JSON first
+    try:
+        return json.loads(working_content.strip())
+    except json.JSONDecodeError:
+        pass
+    
+    # Look for JSON blocks wrapped in code markers
+    json_patterns = [
+        r'```json\s*(.*?)\s*```',  # ```json ... ```
+        r'```\s*(.*?)\s*```',      # ``` ... ```
+        r'\{[\s\S]*\}',            # Bare JSON objects
+    ]
+    
+    for pattern in json_patterns:
+        matches = re.findall(pattern, working_content, re.DOTALL)
+        for match in matches:
+            try:
+                return json.loads(match.strip())
+            except json.JSONDecodeError:
+                continue
+    
+    raise ValueError("No valid JSON found in response")
+
+def generate_structured_output_prompt(messages: List[Dict], schema: Dict, schema_name: str) -> List[Dict]:
+    """Convert structured output request to prompt-engineered messages"""
+    
+    # Create schema instructions for the system prompt
+    schema_instruction = f"""STRUCTURED OUTPUT REQUIRED:
+
+You must respond with valid JSON that exactly matches this schema:
+
+Schema name: {schema_name}
+Schema: {json.dumps(schema, indent=2)}
+
+CRITICAL REQUIREMENTS:
+1. Your response must be ONLY valid JSON - no additional text
+2. All required fields must be present: {schema.get('required', [])}
+3. Field types must match the schema exactly
+4. No additional properties unless allowed by the schema
+5. If you use reasoning mode (<think> tags), place the JSON response AFTER the </think> closing tag
+6. Do not wrap the JSON in code blocks or explanatory text
+
+Example format:
+{{"field1": "value1", "field2": true, "field3": "value3"}}
+"""
+
+    # Prepare messages with structured output context
+    enhanced_messages = []
+    
+    # Add or enhance system message
+    system_message_added = False
+    for msg in messages:
+        if msg.get("role") == "system":
+            enhanced_content = msg["content"] + "\n\n" + schema_instruction
+            enhanced_messages.append({"role": "system", "content": enhanced_content})
+            system_message_added = True
+        else:
+            enhanced_messages.append(msg)
+    
+    # Add system message if none existed
+    if not system_message_added:
+        enhanced_messages.insert(0, {"role": "system", "content": schema_instruction})
+    
+    return enhanced_messages
+
+def format_structured_output_response(json_content: str, original_response: Dict) -> Dict:
+    """Format structured output as OpenAI-compatible response"""
+    
+    return {
+        "id": original_response.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"),
+        "object": "chat.completion",
+        "created": original_response.get("created", int(time.time())),
+        "model": original_response.get("model", DEFAULT_MODEL_NAME),
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": json_content
+            },
+            "logprobs": None,
+            "finish_reason": "stop"
+        }],
+        "usage": original_response.get("usage", {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }),
+        "system_fingerprint": original_response.get("system_fingerprint")
+    }
+
 def generate_function_calling_prompt(messages: List[Dict], tools: List[Dict], tool_choice: Any = "auto") -> List[Dict]:
     """Convert function calling request to prompt-engineered messages"""
     
@@ -540,20 +717,241 @@ async def stream_function_call_response(response: httpx.Response, tools: List[Di
         logger.error(f"Error streaming function call response: {e}")
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
+async def stream_structured_output_response_with_logging(
+    response: httpx.Response, 
+    schema: Dict,
+    schema_name: str,
+    original_body: Dict, 
+    upstream_content: Dict,
+    start_time: float,
+    original_model: str,
+    request: Request
+) -> AsyncGenerator[str, None]:
+    """Stream structured output responses with validation and logging"""
+    
+    accumulated_content = ""
+    accumulated_response = ""
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    validation_successful = False
+    validated_json = ""
+    
+    try:
+        async for chunk in response.aiter_text():
+            if chunk:
+                accumulated_response += chunk
+                # Try to parse streaming data
+                lines = chunk.split('\n')
+                for line in lines:
+                    if line.startswith('data: '):
+                        data_str = line[6:]
+                        if data_str.strip() == '[DONE]':
+                            # Process accumulated content for structured output
+                            try:
+                                response_json = extract_json_from_text(accumulated_content)
+                                validate_response_against_schema(response_json, schema)
+                                validated_json = json.dumps(response_json)
+                                validation_successful = True
+                                
+                                # Send the final validated JSON content
+                                final_event = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": DEFAULT_MODEL_NAME,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "content": validated_json
+                                        },
+                                        "logprobs": None,
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(final_event)}\n\n"
+                                
+                            except (ValueError, json.JSONDecodeError) as e:
+                                logger.error(f"Structured output validation failed: {e}")
+                                # Send error event
+                                error_event = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": DEFAULT_MODEL_NAME,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "content": f"Error: Structured output validation failed: {str(e)}"
+                                        },
+                                        "logprobs": None,
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(error_event)}\n\n"
+                            
+                            yield "data: [DONE]\n\n"
+                            return
+                        
+                        try:
+                            data = json.loads(data_str)
+                            delta_content = data.get('choices', [{}])[0].get('delta', {}).get('content')
+                            if delta_content:
+                                accumulated_content += delta_content
+                                # Don't stream content until we validate it
+                                continue
+                        except json.JSONDecodeError:
+                            # Non-JSON streaming data, pass through
+                            yield chunk
+                    else:
+                        yield chunk
+    except Exception as e:
+        logger.error(f"Error streaming structured output response: {e}")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+    finally:
+        # Log the complete streaming response
+        response_time = (time.time() - start_time) * 1000
+        metadata = {
+            'response_time_ms': response_time,
+            'status_code': 200,
+            'original_model': original_model,
+            'mapped_model': DEFAULT_MODEL_NAME,
+            'client_ip': request.client.host if request.client else 'unknown',
+            'user_agent': request.headers.get('user-agent', 'unknown'),
+            'is_streaming': True,
+            'structured_output_requested': True,
+            'structured_output_valid': validation_successful,
+            'schema_name': schema_name,
+            'endpoint': '/v1/chat/completions'
+        }
+        
+        # Create a proper OpenAI chat completion response format for logging
+        response_data = {
+            "id": response_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": DEFAULT_MODEL_NAME,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": validated_json if validation_successful else accumulated_content
+                },
+                "logprobs": None,
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": -1,  # Not available in streaming
+                "completion_tokens": -1,  # Not available in streaming 
+                "total_tokens": -1
+            },
+            "_streaming_metadata": {
+                "content_length": len(accumulated_response),
+                "chunks_received": len([line for line in accumulated_response.split('\n') if line.startswith('data:')]),
+                "structured_output_validation": {
+                    "requested_schema": schema_name,
+                    "validation_successful": validation_successful
+                }
+            }
+        }
+        
+        # Create enhanced original_body with upstream_content if modified
+        enhanced_original_body = original_body.copy()
+        if upstream_content:
+            enhanced_original_body['_upstream_content'] = upstream_content
+        
+        # Async log to Firebase (fire and forget)
+        asyncio.create_task(firebase_logger.log_request_response(enhanced_original_body, response_data, metadata))
+
+async def stream_structured_output_response(response: httpx.Response, schema: Dict, schema_name: str) -> AsyncGenerator[str, None]:
+    """Stream structured output responses with validation (no logging)"""
+    
+    accumulated_content = ""
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    
+    try:
+        async for chunk in response.aiter_text():
+            if chunk:
+                # Try to parse streaming data
+                lines = chunk.split('\n')
+                for line in lines:
+                    if line.startswith('data: '):
+                        data_str = line[6:]
+                        if data_str.strip() == '[DONE]':
+                            # Process accumulated content for structured output
+                            try:
+                                response_json = extract_json_from_text(accumulated_content)
+                                validate_response_against_schema(response_json, schema)
+                                validated_json = json.dumps(response_json)
+                                
+                                # Send the final validated JSON content
+                                final_event = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": DEFAULT_MODEL_NAME,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "content": validated_json
+                                        },
+                                        "logprobs": None,
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(final_event)}\n\n"
+                                
+                            except (ValueError, json.JSONDecodeError) as e:
+                                logger.error(f"Structured output validation failed: {e}")
+                                # Send error event
+                                error_event = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": DEFAULT_MODEL_NAME,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "content": f"Error: Structured output validation failed: {str(e)}"
+                                        },
+                                        "logprobs": None,
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(error_event)}\n\n"
+                            
+                            yield "data: [DONE]\n\n"
+                            return
+                        
+                        try:
+                            data = json.loads(data_str)
+                            delta_content = data.get('choices', [{}])[0].get('delta', {}).get('content')
+                            if delta_content:
+                                accumulated_content += delta_content
+                                # Don't stream content until we validate it
+                                continue
+                        except json.JSONDecodeError:
+                            # Non-JSON streaming data, pass through
+                            yield chunk
+                    else:
+                        yield chunk
+    except Exception as e:
+        logger.error(f"Error streaming structured output response: {e}")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
 @app.get("/")
 async def root():
     return {
         "message": "Solar Proxy API",
-        "description": "Proxies OpenAI-compatible requests to Solar LLM with function calling support",
+        "description": "Proxies OpenAI-compatible requests to Solar LLM with function calling and structured output support",
         "model_mapping": f"All model requests are mapped to: {DEFAULT_MODEL_NAME}",
         "features": [
             "Model mapping",
             "Streaming & non-streaming responses", 
             "Function calling via prompt engineering",
+            "Structured output via prompt engineering",
             "OpenAI API compatibility"
         ],
         "endpoints": {
-            "chat_completions": "POST /v1/chat/completions - Chat completions with function calling",
+            "chat_completions": "POST /v1/chat/completions - Chat completions with function calling and structured output",
             "health": "GET /health - Health check"
         }
     }
@@ -567,14 +965,14 @@ async def health_check():
         "api_key_configured": api_key_configured,
         "service": "Solar Proxy API",
         "default_model": DEFAULT_MODEL_NAME,
-        "features": ["function_calling", "streaming", "model_mapping", "api_key_authentication"],
+        "features": ["function_calling", "structured_output", "streaming", "model_mapping", "api_key_authentication"],
         "auth_required": True,
         "auth_info": "Clients must provide a Bearer token in the Authorization header"
     }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """Proxy chat completions to Solar API with model mapping and function calling support"""
+    """Proxy chat completions to Solar API with model mapping, function calling, and structured output support"""
     
     # Check client API key first
     auth_header = request.headers.get("authorization", "")
@@ -614,12 +1012,48 @@ async def chat_completions(request: Request):
         # Always set reasoning_effort to "high" for upstream requests
         body["reasoning_effort"] = "high"
         
+        # Check if this is a structured output request
+        response_format = body.pop("response_format", None)
+        structured_output_schema = None
+        structured_output_schema_name = None
+        
+        # Handle structured output
+        if response_format and response_format.get("type") == "json_schema":
+            json_schema_config = response_format.get("json_schema", {})
+            structured_output_schema = json_schema_config.get("schema")
+            structured_output_schema_name = json_schema_config.get("name", "structured_output")
+            
+            # Always validate the schema, even if it's None/null
+            try:
+                # Validate the schema first - this will catch null/empty schemas
+                validate_json_schema(structured_output_schema)
+                logger.info(f"Structured output request with schema: {structured_output_schema_name}")
+                
+                # Transform messages for structured output
+                original_messages = body.get("messages", [])
+                enhanced_messages = generate_structured_output_prompt(
+                    original_messages, 
+                    structured_output_schema, 
+                    structured_output_schema_name
+                )
+                body["messages"] = enhanced_messages
+                
+                # Store the modified upstream content for logging
+                upstream_content = body.copy()
+                
+            except ValueError as e:
+                logger.error(f"Invalid structured output schema: {e}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid schema for response_format '{structured_output_schema_name}': {str(e)}"
+                )
+        
         # Check if this is a function calling request
         tools = body.pop("tools", None)
         tool_choice = body.pop("tool_choice", "auto")
         
-        # Handle function calling
-        if tools:
+        # Handle function calling (only if not already handling structured output)
+        if tools and not structured_output_schema:
             logger.info(f"Function calling request with {len(tools)} tools")
             
             # Transform messages for function calling
@@ -688,7 +1122,27 @@ async def chat_completions(request: Request):
             
             # Handle streaming response
             if is_streaming:
-                if tools:
+                if structured_output_schema:
+                    # Special handling for structured output streaming
+                    return StreamingResponse(
+                        stream_structured_output_response_with_logging(
+                            response, 
+                            structured_output_schema, 
+                            structured_output_schema_name, 
+                            original_body, 
+                            upstream_content, 
+                            start_time, 
+                            original_model, 
+                            request
+                        ),
+                        media_type="text/plain",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "Content-Type": "text/plain; charset=utf-8"
+                        }
+                    )
+                elif tools:
                     # Special handling for function call streaming
                     return StreamingResponse(
                         stream_function_call_response_with_logging(response, tools, original_body, upstream_content, start_time, original_model, request),
@@ -715,8 +1169,30 @@ async def chat_completions(request: Request):
             else:
                 response_data = response.json()
                 
+                # Process structured output response if schema was provided
+                if structured_output_schema:
+                    content = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    try:
+                        # Extract and validate JSON from the response
+                        response_json = extract_json_from_text(content)
+                        validate_response_against_schema(response_json, structured_output_schema)
+                        
+                        # Format as structured output response
+                        validated_json = json.dumps(response_json)
+                        formatted_response = format_structured_output_response(validated_json, response_data)
+                        response_data = formatted_response
+                        logger.info(f"Structured output validated successfully for schema: {structured_output_schema_name}")
+                        
+                    except (ValueError, json.JSONDecodeError) as e:
+                        logger.error(f"Structured output validation failed: {e}")
+                        # Return error response
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Structured output validation failed: {str(e)}"
+                        )
+                
                 # Process function calling response if tools were provided
-                if tools:
+                elif tools:
                     content = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
                     function_calls, remaining_text = parse_function_calls(content)
                     
@@ -739,6 +1215,8 @@ async def chat_completions(request: Request):
                     'user_agent': request.headers.get('user-agent', 'unknown'),
                     'is_streaming': is_streaming,
                     'function_calls_detected': function_calls_detected,
+                    'structured_output_requested': bool(structured_output_schema),
+                    'structured_output_schema_name': structured_output_schema_name if structured_output_schema else None,
                     'endpoint': '/v1/chat/completions'
                 }
                 
@@ -831,6 +1309,9 @@ async def chat_completions(request: Request):
             status_code=e.response.status_code,
             detail=f"Upstream API error: {e.response.text}"
         )
+    except HTTPException:
+        # Re-raise HTTPExceptions (like our 400 errors) so they aren't caught by the generic handler
+        raise
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         
