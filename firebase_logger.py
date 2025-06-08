@@ -2,13 +2,14 @@
 Firebase Logger for Solar Proxy
 
 Asynchronously logs proxy requests and responses to Firebase Firestore
-for analytics and monitoring purposes.
+for analytics and monitoring purposes with robust error handling.
 """
 
 import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import firebase_admin
@@ -23,6 +24,14 @@ class FirebaseLogger:
         self.db = None
         self.executor = ThreadPoolExecutor(max_workers=2)  # Dedicated thread pool for Firebase
         self.initialized = False
+        self.last_error_time = 0
+        self.error_count = 0
+        self.max_errors = 5  # Max consecutive errors before disabling
+        self.error_window = 300  # 5 minutes error window
+        self.connection_timeout = 30  # 30 seconds timeout
+        self.retry_attempts = 3
+        
+        # Always attempt to initialize Firebase
         self._init_firebase()
 
     def _init_firebase(self):
@@ -65,6 +74,33 @@ class FirebaseLogger:
         except Exception as e:
             logger.error(f"Failed to initialize Firebase: {e}")
             self.initialized = False
+
+    def _should_log(self) -> bool:
+        """Check if we should attempt logging based on error history"""
+        if not self.initialized:
+            return False
+            
+        current_time = time.time()
+        
+        # Reset error count if enough time has passed
+        if current_time - self.last_error_time > self.error_window:
+            self.error_count = 0
+            
+        # Don't log if we've had too many consecutive errors
+        if self.error_count >= self.max_errors:
+            logger.debug(f"Firebase logging temporarily disabled due to {self.error_count} consecutive errors")
+            return False
+            
+        return True
+
+    def _record_error(self):
+        """Record an error for rate limiting"""
+        self.error_count += 1
+        self.last_error_time = time.time()
+
+    def _record_success(self):
+        """Record a successful operation"""
+        self.error_count = max(0, self.error_count - 1)  # Gradually reduce error count on success
 
     def _sanitize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Remove sensitive information from payload"""
@@ -118,7 +154,9 @@ class FirebaseLogger:
                 'message_count': len(sanitized_request.get('messages', [])),
                 'has_tools': bool(sanitized_request.get('tools')),
                 'has_function_calls': bool(sanitized_response.get('choices', [{}])[0].get('message', {}).get('tool_calls')),
-                '_upstream_content': sanitized_request.get('_upstream_content')  # Include upstream content for transparency
+                '_upstream_content': sanitized_request.get('_upstream_content'),  # Include upstream content for transparency
+                'response_format': sanitized_request.get('response_format'),  # Include structured output info
+                'structured_output_requested': metadata.get('structured_output_requested', False)
             },
             'response': {
                 'model': sanitized_response.get('model'),
@@ -128,6 +166,8 @@ class FirebaseLogger:
                 'status_code': metadata.get('status_code', 200),
                 'is_streaming': metadata.get('is_streaming', False),
                 'function_calls_detected': metadata.get('function_calls_detected', 0),
+                'structured_output_valid': metadata.get('structured_output_valid'),
+                'schema_name': metadata.get('structured_output_schema_name'),
                 'content_length': len(str(sanitized_response))
             },
             'metadata': {
@@ -143,22 +183,35 @@ class FirebaseLogger:
         
         return log_entry
 
-    def _write_to_firebase(self, log_entry: Dict[str, Any]):
-        """Synchronous Firebase write operation"""
-        try:
-            if not self.initialized or not self.db:
-                logger.warning("Firebase not initialized, skipping log")
-                return
+    def _write_to_firebase_with_retry(self, log_entry: Dict[str, Any]):
+        """Synchronous Firebase write operation with retry logic"""
+        for attempt in range(self.retry_attempts):
+            try:
+                if not self.initialized or not self.db:
+                    logger.warning("Firebase not initialized, skipping log")
+                    return
 
-            # Write to Firestore collection
-            collection_name = f"proxy_logs_{datetime.now().strftime('%Y_%m_%d')}"  # Daily collections
-            doc_ref = self.db.collection(collection_name).document(log_entry['request_id'])
-            doc_ref.set(log_entry)
-            
-            logger.debug(f"Successfully logged request {log_entry['request_id']} to Firebase")
-            
-        except Exception as e:
-            logger.error(f"Failed to write to Firebase: {e}")
+                # Write to Firestore collection with timeout
+                collection_name = f"proxy_logs_{datetime.now().strftime('%Y_%m_%d')}"  # Daily collections
+                doc_ref = self.db.collection(collection_name).document(log_entry['request_id'])
+                
+                # Set document with timeout
+                doc_ref.set(log_entry)
+                
+                logger.debug(f"Successfully logged request {log_entry['request_id']} to Firebase (attempt {attempt + 1})")
+                self._record_success()
+                return
+                
+            except Exception as e:
+                logger.warning(f"Firebase write attempt {attempt + 1}/{self.retry_attempts} failed: {e}")
+                if attempt == self.retry_attempts - 1:
+                    # Last attempt failed
+                    logger.error(f"Failed to write to Firebase after {self.retry_attempts} attempts: {e}")
+                    self._record_error()
+                else:
+                    # Wait before retry with exponential backoff
+                    wait_time = (2 ** attempt) * 0.5  # 0.5s, 1s, 2s
+                    time.sleep(wait_time)
 
     async def log_request_response(self,
                                  request_payload: Dict[str, Any],
@@ -172,8 +225,7 @@ class FirebaseLogger:
             response_data: The response data
             metadata: Additional metadata (response time, client info, etc.)
         """
-        if not self.initialized:
-            logger.debug("Firebase logging disabled")
+        if not self._should_log():
             return
             
         try:
@@ -184,12 +236,19 @@ class FirebaseLogger:
             # Prepare log entry
             log_entry = self._prepare_log_entry(request_payload, response_data, metadata)
             
-            # Write to Firebase asynchronously using thread pool
+            # Write to Firebase asynchronously using thread pool with timeout
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(self.executor, self._write_to_firebase, log_entry)
+            await asyncio.wait_for(
+                loop.run_in_executor(self.executor, self._write_to_firebase_with_retry, log_entry),
+                timeout=self.connection_timeout
+            )
             
+        except asyncio.TimeoutError:
+            logger.warning(f"Firebase logging timed out after {self.connection_timeout}s")
+            self._record_error()
         except Exception as e:
             logger.error(f"Error in async Firebase logging: {e}")
+            self._record_error()
 
     async def log_error(self,
                        request_payload: Dict[str, Any],
@@ -203,7 +262,7 @@ class FirebaseLogger:
             error_details: Error information
             metadata: Additional metadata
         """
-        if not self.initialized:
+        if not self._should_log():
             return
             
         try:
