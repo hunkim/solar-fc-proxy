@@ -1,4 +1,4 @@
-.PHONY: install run dev test test-firebase test-advanced clean help venv setup-firebase
+.PHONY: install run dev prod prod-simple test test-firebase test-advanced test-retry test-all clean help venv setup-firebase
 
 # Virtual environment settings
 VENV_DIR = .venv
@@ -14,9 +14,13 @@ help:
 	@echo "  setup-firebase Setup Firebase dependencies and create config template"
 	@echo "  run            Run the application"
 	@echo "  dev            Run the application in development mode with auto-reload"
+	@echo "  prod           Run the application in production mode (4 workers)"
+	@echo "  prod-simple    Run the application in production mode (single worker)"
 	@echo "  test           Test the API endpoints"
 	@echo "  test-firebase  Test Firebase logging functionality"
 	@echo "  test-advanced  Run advanced function calling tests"
+	@echo "  test-retry     Test structured output retry logic"
+	@echo "  test-all       Run comprehensive test suite"
 	@echo "  clean          Clean cache files and virtual environment"
 	@echo "  help           Show this help message"
 	@echo ""
@@ -24,7 +28,12 @@ help:
 	@echo "  1. Create .env.local file with: UPSTAGE_API_KEY=your_key_here"
 	@echo "  2. Run 'make install' to create venv and install dependencies"
 	@echo "  3. Run 'make setup-firebase' to setup Firebase logging (optional)"
-	@echo "  4. Run 'make dev' to start development server"
+	@echo "  4. Run 'make dev' for development or 'make prod' for production"
+	@echo ""
+	@echo "Server modes:"
+	@echo "  dev         - Development server with auto-reload (slower, for testing)"
+	@echo "  prod        - Production server with 4 workers (fastest, best for load)"
+	@echo "  prod-simple - Production server with 1 worker (reliable, good for testing)"
 	@echo ""
 	@echo "To activate virtual environment manually:"
 	@echo "  source $(VENV_DIR)/bin/activate"
@@ -78,6 +87,16 @@ run: install
 dev: install
 	$(UVICORN) main:app --host 0.0.0.0 --port 8000 --reload
 
+# Run in production mode (optimized)
+prod: install
+	@echo "Starting production server with 4 workers..."
+	$(UVICORN) main:app --host 0.0.0.0 --port 8000 --workers 4 --loop uvloop --http httptools --log-level info
+
+# Run in production mode (single worker, most reliable)
+prod-simple: install
+	@echo "Starting production server (single worker)..."
+	$(UVICORN) main:app --host 0.0.0.0 --port 8000 --loop uvloop --http httptools --log-level info
+
 # Test the API endpoints
 test:
 	@echo "Testing the Solar Proxy API..."
@@ -102,6 +121,24 @@ test-firebase: install
 test-advanced: install
 	@echo "Running advanced function calling tests..."
 	$(PYTHON) test_advanced_function_calling.py
+
+# Test structured output retry logic
+test-retry: install
+	@echo "Testing structured output retry logic..."
+	$(PYTHON) test_retry_logic.py
+
+# Run comprehensive test suite
+test-all: install
+	@echo "Running comprehensive test suite..."
+	@echo "1. Testing basic API endpoints..."
+	@make test
+	@echo "\n2. Testing Firebase logging..."
+	@make test-firebase
+	@echo "\n3. Testing advanced function calling..."
+	@make test-advanced  
+	@echo "\n4. Testing structured output retry logic..."
+	@make test-retry
+	@echo "\n✅ All tests completed!"
 
 # Clean cache files
 clean:

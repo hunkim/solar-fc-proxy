@@ -18,7 +18,7 @@ load_dotenv('.env.local')
 from firebase_logger import firebase_logger
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -937,11 +937,59 @@ async def stream_structured_output_response(response: httpx.Response, schema: Di
         logger.error(f"Error streaming structured output response: {e}")
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
+def generate_schema_example(schema: Dict) -> str:
+    """Generate an example JSON output based on the schema"""
+    try:
+        properties = schema.get("properties", {})
+        example = {}
+        
+        for field_name, field_schema in properties.items():
+            if "anyOf" in field_schema:
+                # Handle union types - use the first option
+                first_option = field_schema["anyOf"][0]
+                example[field_name] = generate_field_example(field_name, first_option)
+            else:
+                example[field_name] = generate_field_example(field_name, field_schema)
+        
+        return json.dumps(example, indent=2)
+    except Exception:
+        # Fallback to a simple example
+        return '{"field": "value"}'
+
+def generate_field_example(field_name: str, field_schema: Dict) -> Any:
+    """Generate an example value for a specific field"""
+    field_type = field_schema.get("type", "string")
+    
+    if field_type == "string":
+        if "name" in field_name.lower():
+            return "John Doe"
+        elif "reason" in field_name.lower():
+            return "This is a valid reason"
+        elif "answer" in field_name.lower():
+            return "This is the answer"
+        else:
+            return "example_value"
+    elif field_type == "boolean":
+        return True
+    elif field_type == "integer":
+        if "age" in field_name.lower():
+            return 30
+        else:
+            return 42
+    elif field_type == "number":
+        return 3.14
+    elif field_type == "array":
+        return ["example_item"]
+    elif field_type == "object":
+        return {"example_key": "example_value"}
+    else:
+        return "example"
+
 @app.get("/")
 async def root():
     return {
         "message": "Solar Proxy API",
-        "description": "Proxies OpenAI-compatible requests to Solar LLM with function calling and structured output support",
+        "description": "Proxies OpenAI-compatible requests to Solar LLM with function calling, structured output, and intelligent retry logic",
         "model_mapping": f"All model requests are mapped to: {DEFAULT_MODEL_NAME}",
         "features": [
             "Model mapping",
@@ -969,6 +1017,126 @@ async def health_check():
         "auth_required": True,
         "auth_info": "Clients must provide a Bearer token in the Authorization header"
     }
+
+@app.post("/debug/structured-output")
+async def debug_structured_output(request: Request):
+    """Debug endpoint to test structured output parsing without validation"""
+    try:
+        body = await request.json()
+        
+        # Check auth
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Authorization required")
+        
+        client_api_key = auth_header[7:]
+        
+        # Extract test parameters
+        test_content = body.get("test_content", "")
+        test_schema = body.get("test_schema")
+        
+        if test_content:
+            # Test JSON extraction
+            try:
+                extracted_json = extract_json_from_text(test_content)
+                extraction_success = True
+                extraction_error = None
+            except Exception as e:
+                extracted_json = None
+                extraction_success = False
+                extraction_error = str(e)
+            
+            # Test schema validation if provided
+            validation_success = None
+            validation_error = None
+            if test_schema and extracted_json:
+                try:
+                    validate_response_against_schema(extracted_json, test_schema)
+                    validation_success = True
+                except Exception as e:
+                    validation_success = False
+                    validation_error = str(e)
+            
+            return {
+                "test_content": test_content,
+                "test_schema": test_schema,
+                "extraction": {
+                    "success": extraction_success,
+                    "extracted_json": extracted_json,
+                    "error": extraction_error
+                },
+                "validation": {
+                    "success": validation_success,
+                    "error": validation_error
+                } if test_schema else None
+            }
+        
+        # Make a real test request to Solar
+        test_messages = body.get("messages", [
+            {"role": "user", "content": "Generate a simple person profile with name and age"}
+        ])
+        
+        headers = {
+            "Authorization": f"Bearer {client_api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        test_payload = {
+            "model": DEFAULT_MODEL_NAME,
+            "messages": test_messages,
+            "reasoning_effort": "high",
+            "max_tokens": 500,
+            "temperature": 0.3
+        }
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(UPSTAGE_API_URL, headers=headers, json=test_payload)
+            
+            if response.status_code != 200:
+                return {
+                    "error": "Upstream API error",
+                    "status_code": response.status_code,
+                    "response_text": response.text
+                }
+            
+            response_data = response.json()
+            content = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+            
+            # Test JSON extraction
+            try:
+                extracted_json = extract_json_from_text(content)
+                extraction_success = True
+                extraction_error = None
+            except Exception as e:
+                extracted_json = None
+                extraction_success = False
+                extraction_error = str(e)
+            
+            return {
+                "upstream_response": {
+                    "status_code": response.status_code,
+                    "content": content,
+                    "full_response": response_data
+                },
+                "extraction": {
+                    "success": extraction_success,
+                    "extracted_json": extracted_json,
+                    "error": extraction_error
+                },
+                "diagnostics": {
+                    "content_length": len(content),
+                    "contains_think_tags": "<think>" in content and "</think>" in content,
+                    "contains_json_blocks": "```json" in content or "```" in content,
+                    "contains_braces": "{" in content and "}" in content
+                }
+            }
+    
+    except Exception as e:
+        return {
+            "error": "Debug endpoint error",
+            "message": str(e),
+            "type": type(e).__name__
+        }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -1004,7 +1172,7 @@ async def chat_completions(request: Request):
         
         # Log original model request
         original_model = body.get("model", "not specified")
-        logger.info(f"Request for model '{original_model}' -> mapping to '{DEFAULT_MODEL_NAME}'")
+        logger.debug(f"Request for model '{original_model}' -> mapping to '{DEFAULT_MODEL_NAME}'")
         
         # Override the model with our default
         body["model"] = DEFAULT_MODEL_NAME
@@ -1027,7 +1195,7 @@ async def chat_completions(request: Request):
             try:
                 # Validate the schema first - this will catch null/empty schemas
                 validate_json_schema(structured_output_schema)
-                logger.info(f"Structured output request with schema: {structured_output_schema_name}")
+                logger.debug(f"Structured output request with schema: {structured_output_schema_name}")
                 
                 # Transform messages for structured output
                 original_messages = body.get("messages", [])
@@ -1054,7 +1222,7 @@ async def chat_completions(request: Request):
         
         # Handle function calling (only if not already handling structured output)
         if tools and not structured_output_schema:
-            logger.info(f"Function calling request with {len(tools)} tools")
+            logger.debug(f"Function calling request with {len(tools)} tools")
             
             # Transform messages for function calling
             original_messages = body.get("messages", [])
@@ -1172,24 +1340,109 @@ async def chat_completions(request: Request):
                 # Process structured output response if schema was provided
                 if structured_output_schema:
                     content = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
-                    try:
-                        # Extract and validate JSON from the response
-                        response_json = extract_json_from_text(content)
-                        validate_response_against_schema(response_json, structured_output_schema)
-                        
-                        # Format as structured output response
-                        validated_json = json.dumps(response_json)
-                        formatted_response = format_structured_output_response(validated_json, response_data)
-                        response_data = formatted_response
-                        logger.info(f"Structured output validated successfully for schema: {structured_output_schema_name}")
-                        
-                    except (ValueError, json.JSONDecodeError) as e:
-                        logger.error(f"Structured output validation failed: {e}")
-                        # Return error response
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Structured output validation failed: {str(e)}"
-                        )
+                    
+                    # Retry logic for structured output validation
+                    max_retries = 3
+                    retry_count = 0
+                    validation_successful = False
+                    last_error = None
+                    
+                    while retry_count < max_retries and not validation_successful:
+                        try:
+                            # Extract and validate JSON from the response
+                            response_json = extract_json_from_text(content)
+                            validate_response_against_schema(response_json, structured_output_schema)
+                            
+                            # Format as structured output response
+                            validated_json = json.dumps(response_json)
+                            formatted_response = format_structured_output_response(validated_json, response_data)
+                            response_data = formatted_response
+                            validation_successful = True
+                            logger.debug(f"Structured output validated successfully for schema: {structured_output_schema_name}" + 
+                                      (f" (after {retry_count} retries)" if retry_count > 0 else ""))
+                            
+                        except (ValueError, json.JSONDecodeError) as e:
+                            retry_count += 1
+                            last_error = e
+                            logger.warning(f"Structured output validation failed (attempt {retry_count}/{max_retries}): {e}")
+                            
+                            if retry_count < max_retries:
+                                # Retry with adjusted parameters
+                                logger.debug(f"Retrying structured output request (attempt {retry_count + 1}/{max_retries})")
+                                
+                                # Adjust temperature slightly for retry (make it more focused)
+                                retry_temperature = max(0.1, body.get("temperature", 0.7) - (retry_count * 0.2))
+                                
+                                # Create retry request body
+                                retry_body = body.copy()
+                                retry_body["temperature"] = retry_temperature
+                                retry_body["max_tokens"] = body.get("max_tokens", 1000)
+                                
+                                # Enhanced prompt for retry
+                                if retry_count == 1:
+                                    # First retry: emphasize JSON format
+                                    enhanced_messages = []
+                                    for msg in retry_body["messages"]:
+                                        if msg.get("role") == "system":
+                                            enhanced_content = msg["content"] + "\n\nIMPORTANT: You MUST respond with ONLY valid JSON. Do not include any explanatory text, code blocks, or reasoning. Just the raw JSON object."
+                                            enhanced_messages.append({"role": "system", "content": enhanced_content})
+                                        else:
+                                            enhanced_messages.append(msg)
+                                    retry_body["messages"] = enhanced_messages
+                                elif retry_count == 2:
+                                    # Second retry: add example and simplify
+                                    enhanced_messages = []
+                                    for msg in retry_body["messages"]:
+                                        if msg.get("role") == "system":
+                                            schema_example = generate_schema_example(structured_output_schema)
+                                            enhanced_content = msg["content"] + f"\n\nEXAMPLE OUTPUT:\n{schema_example}\n\nRespond with EXACTLY this format - pure JSON only."
+                                            enhanced_messages.append({"role": "system", "content": enhanced_content})
+                                        else:
+                                            enhanced_messages.append(msg)
+                                    retry_body["messages"] = enhanced_messages
+                                
+                                # Make retry request
+                                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as retry_client:
+                                    retry_response = await retry_client.post(
+                                        UPSTAGE_API_URL, 
+                                        headers=headers, 
+                                        json=retry_body,
+                                        timeout=REQUEST_TIMEOUT
+                                    )
+                                    
+                                    if retry_response.status_code == 200:
+                                        response_data = retry_response.json()
+                                        content = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                                        logger.debug(f"Retry {retry_count} response content: {content[:200]}...")
+                                    else:
+                                        logger.error(f"Retry {retry_count} failed with status {retry_response.status_code}")
+                                        break
+                            else:
+                                # All retries exhausted
+                                logger.error(f"All {max_retries} structured output validation attempts failed. Last error: {last_error}")
+                                # Log the actual content that failed validation for debugging
+                                logger.error(f"Final content that failed validation: {content[:500]}...")
+                                
+                                # Return detailed error response
+                                error_response = {
+                                    "error": {
+                                        "message": f"Structured output validation failed after {max_retries} attempts: {str(last_error)}",
+                                        "type": "structured_output_validation_error",
+                                        "param": structured_output_schema_name,
+                                        "code": "invalid_structured_output",
+                                        "details": {
+                                            "attempts": max_retries,
+                                            "last_error": str(last_error),
+                                            "content_preview": content[:200] if content else "No content"
+                                        }
+                                    }
+                                }
+                                
+                                return Response(
+                                    content=json.dumps(error_response),
+                                    status_code=400,
+                                    media_type="application/json"
+                                )
                 
                 # Process function calling response if tools were provided
                 elif tools:
@@ -1198,11 +1451,11 @@ async def chat_completions(request: Request):
                     
                     if function_calls:
                         function_calls_detected = len(function_calls)
-                        logger.info(f"Detected {function_calls_detected} function calls")
+                        logger.debug(f"Detected {function_calls_detected} function calls")
                         formatted_response = format_function_call_response(function_calls, response_data)
                         response_data = formatted_response
                     else:
-                        logger.info("No function calls detected, returning normal response")
+                        logger.debug("No function calls detected, returning normal response")
                 
                 # Calculate response time and prepare metadata
                 response_time = (time.time() - start_time) * 1000
